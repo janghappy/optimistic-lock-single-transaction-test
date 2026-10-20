@@ -83,5 +83,5 @@ try {
 | `ObjectOptimisticLockingFailureException` | 동작하지만 Hibernate 경로에서 변환된 구체 타입에 묶인다 |
 | **`OptimisticLockingFailureException`** | 변환 경로(Hibernate / JPA 표준)가 달라져도 함께 잡힌다 |
 
-이 프로젝트의 테스트(Case2, Case3)도 같은 이유로 `OptimisticLockingFailureException` 으로 검증한다.
+이 프로젝트의 테스트(Case2, Case3, Case4)도 같은 이유로 `OptimisticLockingFailureException` 으로 검증한다.
 어느 엔티티에서 충돌했는지 로그로 남기려면 `ObjectOptimisticLockingFailureException` 의 `getPersistentClassName()`, `getIdentifier()` 를 쓸 수 있다.

@@ -8,11 +8,16 @@ import com.example.optimistic_lock_single_transaction_test.service.PurchaseServi
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 구매 테스트 공통 설정. 초기 상태: 재고 100, 보유수량 0, version 은 둘 다 0
@@ -66,6 +71,44 @@ public abstract class PurchaseTestSupport {
 		CompletableFuture.runAsync(() ->
 				jdbcTemplate.update("update " + table + " set version = version + 1 where id = ?", id)
 		).join();
+	}
+
+	/**
+	 * threadCount 개 스레드에서 task 를 동시에 한 번씩 실행하고, 성공/낙관적 락 충돌 건수를 센다.
+	 */
+	protected ConcurrentResult runConcurrently(int threadCount, Runnable task) throws InterruptedException {
+		ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+		CountDownLatch ready = new CountDownLatch(1);
+		CountDownLatch done = new CountDownLatch(threadCount);
+		AtomicInteger successCount = new AtomicInteger();
+		AtomicInteger conflictCount = new AtomicInteger();
+
+		for (int i = 0; i < threadCount; i++) {
+			executor.submit(() -> {
+				try {
+					ready.await();
+					task.run();
+					successCount.incrementAndGet();
+				} catch (OptimisticLockingFailureException e) {
+					conflictCount.incrementAndGet();
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				} finally {
+					done.countDown();
+				}
+			});
+		}
+		ready.countDown();
+		done.await();
+		executor.shutdown();
+
+		ConcurrentResult result = new ConcurrentResult(successCount.get(), conflictCount.get());
+		System.out.printf("성공: %d, 충돌(롤백): %d, 재고: %d, 보유수량: %d%n",
+				result.successCount(), result.conflictCount(), findStock().getQuantity(), findUserItem().getQuantity());
+		return result;
+	}
+
+	protected record ConcurrentResult(int successCount, int conflictCount) {
 	}
 
 	protected Stock findStock() {

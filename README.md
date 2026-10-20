@@ -20,6 +20,7 @@
 | `UserItem` (사용자 보유수량) | `id`, `userId`, `quantity`, `@Version version` | `increase(n)` |
 
 - `StockRepository`, `UserItemRepository` : `JpaRepository` 상속
+- 구매는 재고에서 보유수량으로 수량을 옮기는 것이므로 **재고 + 보유수량 = 초기 재고** 가 항상 성립해야 한다.
 
 ### 3) 서비스 코드 — `PurchaseService.purchase()`
 ```java
@@ -43,8 +44,9 @@ public void purchase(Long userItemId, Long stockId, int quantity) {
 | 1 | `Case1SuccessTest` | 정상 | 5개 구매 |
 | 2 | `Case2StockConflictTest` | 재고 차감 단계에서 충돌 | 5개 구매, 커밋 전에 다른 트랜잭션이 **재고** 행을 먼저 수정·커밋 |
 | 3 | `Case3UserItemConflictTest` | 보유수량 증가 단계에서 충돌 | 5개 구매, 커밋 전에 다른 트랜잭션이 **보유수량** 행을 먼저 수정·커밋 |
+| 4 | `Case4ConcurrencyTest` | 동시성 (재시도 없음) | 10개 스레드가 동시에 1개씩 구매. ① 최종 정합성 ② 처리 건수 확인 |
 
-- 테스트는 **Case1 → Case2 → Case3** 순서로 실행된다. 서비스 로직 순서(재고 차감 → 보유수량 증가)대로 재고 충돌(Case2)을 먼저 확인한다.
+- 테스트는 **Case1 → Case2 → Case3 → Case4** 순서로 실행된다. 서비스 로직 순서(재고 차감 → 보유수량 증가)대로 재고 충돌(Case2)을 먼저 확인한다.
   - 클래스명 앞의 `CaseN` 과 `@DisplayName("N) ...")` 으로 순서를 표시
   - `junit-platform.properties` 의 `ClassOrderer$DisplayName` 설정으로 실제 실행 순서도 번호 순서를 따른다
 
@@ -73,6 +75,7 @@ assertThatThrownBy(() -> inTransaction(() -> {
 | 1 | `update stock` 1건 → `update user_item` 1건 | 95 | 5 | 없음 |
 | 2 | `update stock` **0건** → `user_item` 은 실행 안 됨 | 100 (롤백) | 0 (롤백) | `OptimisticLockingFailureException` |
 | 3 | `update stock` **1건 성공** → `update user_item` **0건** | **100 (95 가 아니라 롤백)** | 0 (롤백) | `OptimisticLockingFailureException` |
+| 4 | 실행 예시: 성공 1~3, 충돌 7~9 (실행할 때마다 다름) | 97~99 | 1~3 | 충돌한 요청만 |
 
 > 실제로 던져지는 타입은 하위 타입인 `ObjectOptimisticLockingFailureException` 이다. 테스트는 상위 타입인 `OptimisticLockingFailureException` 으로 검증한다.
 > 예외가 어떻게 감싸지는지, Spring 없이 순수 JPA 로 실행하면 어떤 예외가 나는지는 [낙관적 락 예외 정리](docs/optimistic-lock-exception.md) 참고.
@@ -90,6 +93,8 @@ ObjectOptimisticLockingFailureException: Unexpected row count (expected row coun
 **정리**
 - Case2 처럼 첫 UPDATE(`stock`) 에서 실패하면 그 뒤 UPDATE 는 아예 실행되지 않는다.
 - **Case3 이 핵심이다.** `stock` UPDATE 는 DB 에서 이미 1건 성공(100 → 95)했지만, 같은 트랜잭션의 `user_item` UPDATE 가 실패하자 `stock` 도 100 으로 롤백됐다.
+- Case4 ① **최종 정합성**: 성공/충돌 건수는 매번 달라도 `재고 + 보유수량 = 100` 은 항상 지켜진다.
+- Case4 ② **처리 건수**: 요청 10건 중 1~3건만 처리된다. 10개 요청이 대부분 같은 version 을 읽어서 먼저 커밋한 요청만 성공하기 때문이다. 낙관적 락은 정합성은 지키지만, 충돌한 요청을 대신 처리해 주지는 않는다.
 - 충돌은 `decrease()`/`increase()` 호출 시점이 아니라 커밋 시점에 감지되므로 서비스 메서드 안의 `try-catch` 로는 잡을 수 없다. 호출하는 쪽에서 `OptimisticLockingFailureException` 을 받아 재시도 등을 처리해야 한다.
 
 ## 기술 스택
