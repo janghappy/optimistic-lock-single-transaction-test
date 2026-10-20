@@ -2,6 +2,96 @@
 
 단일 트랜잭션 안에서 JPA 낙관적 락(Optimistic Lock, `@Version`)이 어떻게 동작하는지 확인하기 위한 테스트 프로젝트입니다.
 
+## 테스트 목적
+
+> 하나의 트랜잭션에서 낙관적 락(`@Version`)을 쓰는 **두 엔티티(재고, 사용자 보유수량)** 를 함께 UPDATE 할 때,
+> 한쪽만 version 충돌이 나면 전부 롤백될까? 아니면 먼저 성공한 쪽은 남을까?
+
+## 단계별 구성
+
+### 1) 기본 환경 세팅
+- Spring Boot + Data JPA + H2(인메모리) 프로젝트
+- `application.yaml`: SQL 로그(`show-sql`)와 `JpaTransactionManager` DEBUG 로그를 켜서 트랜잭션 흐름을 확인
+
+### 2) 기본 서비스 환경 세팅 (엔티티 / 리포지토리)
+| 엔티티 | 필드 | 구매 시 동작 |
+|---|---|---|
+| `Stock` (재고) | `id`, `quantity`, `@Version version` | `decrease(n)` |
+| `UserItem` (사용자 보유수량) | `id`, `userId`, `quantity`, `@Version version` | `increase(n)` |
+
+- `StockRepository`, `UserItemRepository` : `JpaRepository` 상속
+
+### 3) 서비스 코드 — `PurchaseService.purchase()`
+```java
+@Transactional
+public void purchase(Long userItemId, Long stockId, int quantity) {
+    Stock stock = stockRepository.findById(stockId).orElseThrow();
+    stock.decrease(quantity);       // 1. 재고 차감
+
+    UserItem userItem = userItemRepository.findById(userItemId).orElseThrow();
+    userItem.increase(quantity);    // 2. 보유수량 증가
+}
+```
+- 두 UPDATE 모두 커밋(flush) 시점에 `WHERE id = ? AND version = ?` 조건으로 실행된다.
+- flush 시 UPDATE 는 조회한 순서대로 실행된다: `stock` → `user_item`
+
+### 4) 테스트 코드
+초기 상태: 재고 100, 보유수량 0, version 은 둘 다 0 (공통 설정: `support.PurchaseTestSupport`)
+
+| 순서 | 테스트 클래스 | 테스트 | 상황 |
+|---|---|---|---|
+| 1 | `Case1SuccessTest` | 정상 | 5개 구매 |
+| 2 | `Case2StockConflictTest` | 재고 차감 단계에서 충돌 | 5개 구매, 커밋 전에 다른 트랜잭션이 **재고** 행을 먼저 수정·커밋 |
+| 3 | `Case3UserItemConflictTest` | 보유수량 증가 단계에서 충돌 | 5개 구매, 커밋 전에 다른 트랜잭션이 **보유수량** 행을 먼저 수정·커밋 |
+
+- 테스트는 **Case1 → Case2 → Case3** 순서로 실행된다. 서비스 로직 순서(재고 차감 → 보유수량 증가)대로 재고 충돌(Case2)을 먼저 확인한다.
+  - 클래스명 앞의 `CaseN` 과 `@DisplayName("N) ...")` 으로 순서를 표시
+  - `junit-platform.properties` 의 `ClassOrderer$DisplayName` 설정으로 실제 실행 순서도 번호 순서를 따른다
+
+#### version 불일치 재현 방법 (Case2, Case3)
+```java
+assertThatThrownBy(() -> inTransaction(() -> {
+    purchaseService.purchase(userItemId, stockId, 5);    // 재고 100 → 95, 보유수량 0 → 5. 아직 커밋 전 (version 0 기준)
+    otherTransactionModifies("user_item", userItemId);   // 다른 트랜잭션이 먼저 수정·커밋 → DB version 0 → 1
+})).isInstanceOf(OptimisticLockingFailureException.class);  // 커밋 → UPDATE ... WHERE version = 0 → 0건
+```
+| 헬퍼 (`PurchaseTestSupport`) | 역할 |
+|---|---|
+| `inTransaction(action)` | action 을 하나의 트랜잭션으로 묶고 action 이 끝난 뒤 커밋한다. 서비스의 `@Transactional` 이 여기에 참여하므로 `purchase()` 가 끝나도 바로 커밋되지 않아, 커밋 전에 끼어들 틈이 생긴다. |
+| `otherTransactionModifies(table, id)` | 별도 스레드에서 `update {table} set version = version + 1 where id = ?` 를 실행한다. 다른 커넥션이라 즉시 커밋된다. |
+
+- 끼어드는 트랜잭션은 테스트 대상이 아니라 충돌을 만드는 장치이므로 **version 만 올린다.** 데이터는 바꾸지 않기 때문에, 구매 트랜잭션이 롤백됐다면 결과가 초기 상태(재고 100, 보유수량 0)와 같아야 한다.
+- 구매 트랜잭션의 UPDATE 는 커밋 시점에야 실행되므로, 끼어드는 UPDATE 가 행 잠금에 막히지 않는다.
+- 테스트 클래스에 `@Transactional` 을 붙이면 커밋이 일어나지 않아 version 충돌이 재현되지 않으므로 붙이지 않았다.
+
+### 5) 예상 결과 및 동작 확인
+
+**결론: 어느 쪽에서 충돌이 나든 트랜잭션 전체가 롤백된다. 일부만 반영되는 경우는 없다.**
+
+| 순서 | 커밋 시 실행된 SQL | 결과 재고 | 결과 보유수량 | 예외 |
+|---|---|---|---|---|
+| 1 | `update stock` 1건 → `update user_item` 1건 | 95 | 5 | 없음 |
+| 2 | `update stock` **0건** → `user_item` 은 실행 안 됨 | 100 (롤백) | 0 (롤백) | `OptimisticLockingFailureException` |
+| 3 | `update stock` **1건 성공** → `update user_item` **0건** | **100 (95 가 아니라 롤백)** | 0 (롤백) | `OptimisticLockingFailureException` |
+
+> 실제로 던져지는 타입은 하위 타입인 `ObjectOptimisticLockingFailureException` 이다. 테스트는 상위 타입인 `OptimisticLockingFailureException` 으로 검증한다.
+> 예외가 어떻게 감싸지는지, Spring 없이 순수 JPA 로 실행하면 어떤 예외가 나는지는 [낙관적 락 예외 정리](docs/optimistic-lock-exception.md) 참고.
+
+Case3 의 실제 로그 (구매 트랜잭션 커밋 부분):
+```
+Committing JPA transaction ...
+update stock     set quantity=?, version=? where id=? and version=?            ← 1건 성공 (100 → 95)
+update user_item set quantity=?, user_id=?, version=? where id=? and version=?  ← 0건
+Initiating transaction rollback after commit exception
+ObjectOptimisticLockingFailureException: Unexpected row count (expected row count 1 but was 0)
+  [update user_item ...] for entity [...UserItem]
+```
+
+**정리**
+- Case2 처럼 첫 UPDATE(`stock`) 에서 실패하면 그 뒤 UPDATE 는 아예 실행되지 않는다.
+- **Case3 이 핵심이다.** `stock` UPDATE 는 DB 에서 이미 1건 성공(100 → 95)했지만, 같은 트랜잭션의 `user_item` UPDATE 가 실패하자 `stock` 도 100 으로 롤백됐다.
+- 충돌은 `decrease()`/`increase()` 호출 시점이 아니라 커밋 시점에 감지되므로 서비스 메서드 안의 `try-catch` 로는 잡을 수 없다. 호출하는 쪽에서 `OptimisticLockingFailureException` 을 받아 재시도 등을 처리해야 한다.
+
 ## 기술 스택
 
 - Java 17
