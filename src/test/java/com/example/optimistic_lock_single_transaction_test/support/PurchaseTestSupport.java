@@ -42,7 +42,7 @@ public abstract class PurchaseTestSupport {
 	private PlatformTransactionManager transactionManager;
 
 	@Autowired
-	private JdbcTemplate jdbcTemplate;
+	protected JdbcTemplate jdbcTemplate;
 
 	protected Long stockId;
 	protected Long userItemId;
@@ -70,6 +70,15 @@ public abstract class PurchaseTestSupport {
 	protected void otherTransactionModifies(String table, Long id) {
 		CompletableFuture.runAsync(() ->
 				jdbcTemplate.update("update " + table + " set version = version + 1 where id = ?", id)
+		).join();
+	}
+
+	/**
+	 * 다른 커넥션(별도 스레드)에서 해당 행의 quantity 를 조회한다. 커밋된 값만 보인다.
+	 */
+	protected int quantitySeenByOtherConnection(String table, Long id) {
+		return CompletableFuture.supplyAsync(() ->
+				jdbcTemplate.queryForObject("select quantity from " + table + " where id = ?", Integer.class, id)
 		).join();
 	}
 

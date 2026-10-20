@@ -1,11 +1,12 @@
 # 낙관적 락 예외 정리
 
 [README](../README.md) 의 Case2, Case3 처럼 `@Version` 충돌이 났을 때 어떤 예외가 던져지는지 정리한다.
+
 아래 내용은 모두 이 프로젝트(Spring Boot 4.1.1 / Spring 7.0.9 / Hibernate 7)에서 실제로 실행해 확인했다.
 
 ## 1. 예외는 어디서 시작되는가
 
-커밋(flush) 시 Hibernate 가 `UPDATE ... WHERE id = ? AND version = ?` 를 실행하고, 결과가 0건이면 예외를 던진다.
+커밋 처리 중 flush 단계(DB COMMIT 전)에서 Hibernate 가 `UPDATE ... WHERE id = ? AND version = ?` 를 실행하고, 결과가 0건이면 예외를 던진다.
 
 | 예외 | 출처 | 의미 |
 |---|---|---|
@@ -23,6 +24,18 @@ ObjectOptimisticLockingFailureException      (org.springframework.orm)  ← 호�
 ```
 
 JPA 표준 예외(`jakarta.persistence.OptimisticLockException`)는 이 원인 체인에 없다.
+
+### 예외: `EntityManager.flush()` 를 직접 호출한 경우
+
+Spring 은 **트랜잭션 커밋**과 **`@Repository` 빈(Spring Data 리포지토리 포함)의 호출**에서 난 예외만 변환한다.
+
+주입받은 `EntityManager` 로 `flush()` 를 직접 호출하면 변환을 거치지 않아, Spring 환경에서도 JPA 표준 예외가 그대로 나온다.
+
+```
+jakarta.persistence.OptimisticLockException
+ └─ cause: StaleObjectStateException
+     └─ cause: StaleStateException
+```
 
 ### Spring 예외 계층
 
@@ -79,9 +92,12 @@ try {
 
 | 타입 | 평가 |
 |---|---|
-| `jakarta.persistence.OptimisticLockException` | Spring 환경에서는 던져지지 않는다 (원인 체인에도 없음) |
+| `jakarta.persistence.OptimisticLockException` | 커밋 경로에서는 던져지지 않는다. `EntityManager.flush()` 를 직접 호출한 경우에만 나온다 |
 | `ObjectOptimisticLockingFailureException` | 동작하지만 Hibernate 경로에서 변환된 구체 타입에 묶인다 |
-| **`OptimisticLockingFailureException`** | 변환 경로(Hibernate / JPA 표준)가 달라져도 함께 잡힌다 |
+| **`OptimisticLockingFailureException`** | Spring 이 변환한 경우라면 경로(Hibernate / JPA 표준)가 달라도 함께 잡힌다 |
 
-이 프로젝트의 테스트(Case2, Case3, Case4)도 같은 이유로 `OptimisticLockingFailureException` 으로 검증한다.
+이 프로젝트의 테스트(Case2~Case5)도 같은 이유로 `OptimisticLockingFailureException` 으로 검증한다.
+
+단, 서비스 코드에서 `EntityManager.flush()` 를 직접 호출한다면 `jakarta.persistence.OptimisticLockException` 도 함께 처리해야 한다.
+
 어느 엔티티에서 충돌했는지 로그로 남기려면 `ObjectOptimisticLockingFailureException` 의 `getPersistentClassName()`, `getIdentifier()` 를 쓸 수 있다.
